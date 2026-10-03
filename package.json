@@ -1,0 +1,10 @@
+{
+  "name": "passkey-p256-firewall",
+  "private": true,
+  "type": "module",
+  "description": "Build and devnet-test the P-256 passkey firewall hook.",
+  "dependencies": {
+    "xrpl-accountlib": "^9.3.2",
+    "xrpl-client": "^2.4.0"
+  }
+}
