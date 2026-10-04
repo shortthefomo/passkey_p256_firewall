@@ -1,19 +1,26 @@
 // P-256 passkey firewall, v2.
 //
-// A gated native payment must carry a WebAuthn assertion from the enrolled
-// P-256 key. The hook rebuilds a 53-byte payload from the transaction and
-// requires that payload to be the WebAuthn challenge. Signing stays inside
-// WebAuthn: the authenticator signs authenticatorData || SHA-256(clientDataJSON),
-// and the hook verifies SHA-256 of that concatenation.
+// A gated transaction must carry a WebAuthn assertion from the enrolled
+// P-256 key. The hook rebuilds a 53-byte payload and requires that payload
+// to be the WebAuthn challenge. Signing stays inside WebAuthn: the
+// authenticator signs authenticatorData || SHA-256(clientDataJSON), and the
+// hook verifies SHA-256 of that concatenation.
 //
 // Requires util_sha256 and util_verify_p256 (HooksUpdate2, xahaud PR 511).
 //
-// Challenge payload, 53 bytes (this is the WebAuthn challenge, not the signed digest):
+// Payment challenge, 53 bytes (every level, when MODE gates that direction):
 //   0  magic[16]      "xahau.passkey.v2"
 //  16  direction      0 outgoing, 1 incoming
 //  17  sequence[8]    tx Sequence as uint64 big-endian (high 4 bytes 0)
 //  25  counterparty   20-byte account id of the other party
 //  45  drops[8]       native amount in drops, uint64 big-endian
+//
+// Other gated transactions use a different 53-byte challenge:
+//   0  magic[16]      "xahau.passkey.v2"
+//  16  kind           2
+//  17  sequence[4]    tx Sequence, big-endian
+//  21  txhash[32]     SHA-256 of the serialized tx with Memos, TxnSignature,
+//                    and Signers removed. SigningPubKey stays.
 //
 // MemoType = "xahau.passkey.v2"
 // MemoData =
@@ -27,11 +34,16 @@
 //   "RP"   32  SHA-256(relying party id)
 //   "OR"   8..64   exact origin string, for example "https://example.com"
 //   "MODE"  1  0 outgoing, 1 incoming, 2 both (default 0)
+//   "LV"    1  1 payments, 2 value and account control, 3 every outgoing tx
+//              (unset means 1)
 //
 // Invoke parameters (hook owner only) use those same names.
+// At level 1 the owner Invoke is unsigned. At level 2 and 3 it needs the
+// transaction challenge above, then the parameters are applied.
 // v1 memos are not accepted. See ../v1 for plain ECDSA.
 
 #include "hookapi.h"
+#include "../firewall_level.h"
 #include "passkey_v2.h"
 
 extern int64_t
@@ -149,8 +161,60 @@ load_v2_memo(
     return found;
 }
 
+// File scope so the compiler does not clear these inside the hook. A clear
+// loop over FW_TX_MAX would blow the worst-case instruction budget.
+static uint8_t fw_buf_a[FW_TX_MAX];
+static uint8_t fw_buf_b[FW_TX_MAX];
+
+//   1  hash written
+//  -1  the canonical bytes could not be built
+//  -2  the serialized transaction does not fit in FW_TX_MAX
+static inline __attribute__((always_inline)) int32_t
+canonical_hash(uint8_t hash[32])
+{
+    int64_t tx_slot = otxn_slot(1);
+    if (tx_slot < 0)
+        return -1;
+
+    int64_t n = slot((uint32_t)fw_buf_a, FW_TX_MAX, (uint32_t)tx_slot);
+    if (n == TOO_SMALL)
+        return -2;
+    if (n <= 0)
+        return -1;
+
+    // A missing field is copied through and reported as DOESNT_EXIST.
+    int64_t m = sto_erase(
+        (uint32_t)fw_buf_b, FW_TX_MAX, (uint32_t)fw_buf_a, (uint32_t)n, sfMemos);
+    if (m == DOESNT_EXIST)
+        m = n;
+    else if (m <= 0)
+        return -1;
+
+    n = sto_erase(
+        (uint32_t)fw_buf_a,
+        FW_TX_MAX,
+        (uint32_t)fw_buf_b,
+        (uint32_t)m,
+        sfTxnSignature);
+    if (n == DOESNT_EXIST)
+        n = m;
+    else if (n <= 0)
+        return -1;
+
+    m = sto_erase(
+        (uint32_t)fw_buf_b, FW_TX_MAX, (uint32_t)fw_buf_a, (uint32_t)n, sfSigners);
+    if (m == DOESNT_EXIST)
+        m = n;
+    else if (m <= 0)
+        return -1;
+
+    if (util_sha256((uint32_t)hash, 32, (uint32_t)fw_buf_b, (uint32_t)m) != 32)
+        return -1;
+    return 1;
+}
+
 static inline __attribute__((always_inline)) int64_t
-admin(uint8_t hook_acc[20], uint8_t otxn_acc[20])
+admin(uint8_t hook_acc[20], uint8_t otxn_acc[20], int32_t require_change)
 {
     if (!BUFFER_EQUAL_20(hook_acc, otxn_acc))
         FAIL("passkey: only the hook owner can configure");
@@ -219,15 +283,38 @@ admin(uint8_t hook_acc[20], uint8_t otxn_acc[20])
         FAIL("passkey: MODE must be 1 byte");
     }
 
-    if (!changed)
-        FAIL("passkey: Invoke needs PX, PY, RP, OR, and/or MODE");
+    uint8_t level[1];
+    uint8_t k_lv[2] = {'L', 'V'};
+    int64_t level_len = otxn_param(SBUF(level), SBUF(k_lv));
+    if (level_len == 1) {
+        if (level[0] < 1 || level[0] > FW_LEVEL_MAX)
+            FAIL("passkey: LV must be 1, 2, or 3");
+        if (state_set(SBUF(level), SBUF(k_lv)) < 0)
+            FAIL("passkey: could not store LV");
+        changed = 1;
+    } else if (level_len != DOESNT_EXIST) {
+        FAIL("passkey: LV must be 1 byte");
+    }
+
+    if (!changed) {
+        if (require_change)
+            FAIL("passkey: Invoke needs PX, PY, RP, OR, MODE, and/or LV");
+        OK("passkey: signature accepted");
+    }
 
     OK("passkey: configuration stored");
 }
 
+// Fill the payment challenge. *ready is 1 when the caller must verify it.
+// An accept or rollback leaves *ready at 0 and returns that result.
 static inline __attribute__((always_inline)) int64_t
-payment(uint8_t hook_acc[20], uint8_t otxn_acc[20])
+prepare_payment(
+    uint8_t hook_acc[20],
+    uint8_t otxn_acc[20],
+    uint8_t payload[V2_PAYLOAD_LEN],
+    int32_t* ready)
 {
+    *ready = 0;
     int32_t outgoing = BUFFER_EQUAL_20(hook_acc, otxn_acc);
 
     uint8_t counterparty[20];
@@ -276,6 +363,67 @@ payment(uint8_t hook_acc[20], uint8_t otxn_acc[20])
     if (drops < 0)
         FAIL("passkey: only native payments are supported");
 
+    uint8_t seq[4];
+    if (otxn_field(SBUF(seq), sfSequence) != 4)
+        FAIL("passkey: missing Sequence");
+
+    for (int32_t i = 0; GUARD(16), i < 16; ++i)
+        payload[i] = PASSKEY_MAGIC[i];
+    payload[16] = outgoing ? 0 : 1;
+    payload[17] = 0;
+    payload[18] = 0;
+    payload[19] = 0;
+    payload[20] = 0;
+    payload[21] = seq[0];
+    payload[22] = seq[1];
+    payload[23] = seq[2];
+    payload[24] = seq[3];
+    for (int32_t i = 0; GUARD(20), i < 20; ++i)
+        payload[25 + i] = counterparty[i];
+    UINT64_TO_BUF(payload + 45, (uint64_t)drops);
+
+    *ready = 1;
+    return 0;
+}
+
+// Fill the non-payment challenge. Same *ready contract as prepare_payment.
+static inline __attribute__((always_inline)) int64_t
+prepare_tx(uint8_t payload[V2_PAYLOAD_LEN], int32_t* ready)
+{
+    *ready = 0;
+
+    uint8_t seq[4];
+    if (otxn_field(SBUF(seq), sfSequence) != 4)
+        FAIL("passkey: missing Sequence");
+
+    uint8_t txhash[32];
+    int32_t hashed = canonical_hash(txhash);
+    if (hashed == -2)
+        FAIL("passkey: transaction is too large to authorize");
+    if (hashed != 1)
+        FAIL("passkey: could not bind this transaction");
+
+    for (int32_t i = 0; GUARD(16), i < 16; ++i)
+        payload[i] = PASSKEY_MAGIC[i];
+    payload[16] = FW_TX_KIND;
+    payload[17] = seq[0];
+    payload[18] = seq[1];
+    payload[19] = seq[2];
+    payload[20] = seq[3];
+    for (int32_t i = 0; GUARD(32), i < 32; ++i)
+        payload[21 + i] = txhash[i];
+
+    *ready = 1;
+    return 0;
+}
+
+// One WebAuthn check for every gated payload. Keeping this call site singular
+// matters: a second copy of the clientDataJSON scan exceeds the instruction budget.
+static inline __attribute__((always_inline)) int64_t
+authorize(uint8_t payload[V2_PAYLOAD_LEN], int32_t* ready)
+{
+    *ready = 0;
+
     uint8_t px[32];
     uint8_t py[32];
     uint8_t k_px[2] = {'P', 'X'};
@@ -295,10 +443,6 @@ payment(uint8_t hook_acc[20], uint8_t otxn_acc[20])
         FAIL("passkey: OR is not set");
     if (origin_len64 < 8 || origin_len64 > V2_MAX_ORIGIN)
         FAIL("passkey: stored OR is invalid");
-
-    uint8_t seq[4];
-    if (otxn_field(SBUF(seq), sfSequence) != 4)
-        FAIL("passkey: missing Sequence");
 
     uint8_t slotbuf[V2_SLOT_LEN];
     const uint8_t* body = 0;
@@ -326,28 +470,12 @@ payment(uint8_t hook_acc[20], uint8_t otxn_acc[20])
     if ((view.auth[32] & AUTH_UP) == 0 || (view.auth[32] & AUTH_UV) == 0)
         FAIL("passkey: user presence and verification required");
 
-    uint8_t payload[V2_PAYLOAD_LEN];
-    for (int32_t i = 0; GUARD(16), i < 16; ++i)
-        payload[i] = PASSKEY_MAGIC[i];
-    payload[16] = outgoing ? 0 : 1;
-    payload[17] = 0;
-    payload[18] = 0;
-    payload[19] = 0;
-    payload[20] = 0;
-    payload[21] = seq[0];
-    payload[22] = seq[1];
-    payload[23] = seq[2];
-    payload[24] = seq[3];
-    for (int32_t i = 0; GUARD(20), i < 20; ++i)
-        payload[25 + i] = counterparty[i];
-    UINT64_TO_BUF(payload + 45, (uint64_t)drops);
-
     int32_t json_rc = v2_client_data_ok(
         view.json, view.json_len, payload, origin, (int32_t)origin_len64);
     if (json_rc == V2_ERR_JSON)
         FAIL("passkey: clientDataJSON is not plain ASCII");
     if (json_rc == V2_ERR_CHALLENGE_COUNT || json_rc == V2_ERR_CHALLENGE)
-        FAIL("passkey: challenge does not match this payment");
+        FAIL("passkey: challenge does not match this transaction");
     if (json_rc == V2_ERR_TYPE)
         FAIL("passkey: clientData type must be webauthn.get");
     if (json_rc == V2_ERR_ORIGIN)
@@ -384,7 +512,8 @@ payment(uint8_t hook_acc[20], uint8_t otxn_acc[20])
     if (verified != 1)
         FAIL("passkey: invalid P-256 passkey signature");
 
-    OK("passkey: signature accepted");
+    *ready = 1;
+    return 0;
 }
 
 int64_t
@@ -400,10 +529,45 @@ hook(uint32_t reserved)
     if (otxn_field(SBUF(otxn_acc), sfAccount) != 20)
         FAIL("passkey: could not read origin account");
 
+    uint8_t level_buf[1];
+    uint8_t k_lv[2] = {'L', 'V'};
+    int64_t level_len = state(SBUF(level_buf), SBUF(k_lv));
+    uint8_t level = 1;
+    if (level_len == 1)
+        level = level_buf[0];
+    else if (level_len != DOESNT_EXIST)
+        FAIL("passkey: stored LV is invalid");
+    if (level < 1 || level > FW_LEVEL_MAX)
+        FAIL("passkey: stored LV is invalid");
+
     int64_t tt = otxn_type();
-    if (tt == ttINVOKE)
-        return admin(hook_acc, otxn_acc);
-    if (tt != ttPAYMENT)
-        OK("passkey: passthrough");
-    return payment(hook_acc, otxn_acc);
+    int32_t require_change = 1;
+    // One admin call site. A second inline copy of the origin check does not
+    // fit in the worst-case instruction budget. Level 1 Invoke skips the
+    // signature and configures directly. Level 2 and 3 sign the Invoke first.
+    if (tt != ttINVOKE || level >= 2) {
+        uint8_t payload[V2_PAYLOAD_LEN];
+        int32_t ready = 0;
+        int64_t rc = 0;
+        if (tt == ttPAYMENT) {
+            rc = prepare_payment(hook_acc, otxn_acc, payload, &ready);
+        } else {
+            int32_t outgoing = BUFFER_EQUAL_20(hook_acc, otxn_acc);
+            uint8_t min_level = fw_gate_level(tt);
+            if (!outgoing || min_level == 0 || level < min_level)
+                OK("passkey: passthrough");
+            rc = prepare_tx(payload, &ready);
+        }
+        if (!ready)
+            return rc;
+
+        ready = 0;
+        rc = authorize(payload, &ready);
+        if (!ready)
+            return rc;
+        if (tt != ttINVOKE)
+            OK("passkey: signature accepted");
+        require_change = 0;
+    }
+    return admin(hook_acc, otxn_acc, require_change);
 }

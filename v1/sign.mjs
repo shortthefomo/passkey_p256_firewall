@@ -11,6 +11,7 @@ const { subtle } = webcrypto;
 export const MAGIC = "xahau.passkey.v1";
 export const MEMO_TYPE_HEX = Buffer.from(MAGIC, "ascii").toString("hex").toUpperCase();
 export const PAYLOAD_LEN = 53;
+export const TX_KIND = 2;
 
 export function buildPayload({ direction, sequence, counterparty, drops }) {
   if (direction !== 0 && direction !== 1)
@@ -28,6 +29,22 @@ export function buildPayload({ direction, sequence, counterparty, drops }) {
   payload.writeUInt32BE(Number(sequence), 21);
   other.copy(payload, 25);
   payload.writeBigUInt64BE(BigInt(drops), 45);
+  return payload;
+}
+
+// 53-byte challenge for a gated non-payment. txHash is SHA-256 of the
+// serialized transaction with Memos, TxnSignature, and Signers removed.
+export function buildTxPayload({ sequence, txHash }) {
+  const hash = Buffer.isBuffer(txHash) ? txHash : Buffer.from(txHash);
+  if (hash.length !== 32) throw new Error("tx hash must be 32 bytes");
+  const seq = Number(sequence);
+  if (!Number.isInteger(seq) || seq < 0 || seq > 0xffffffff)
+    throw new Error("sequence must be a uint32");
+  const payload = Buffer.alloc(PAYLOAD_LEN);
+  payload.write(MAGIC, 0, "ascii");
+  payload[16] = TX_KIND;
+  payload.writeUInt32BE(seq, 17);
+  hash.copy(payload, 21);
   return payload;
 }
 

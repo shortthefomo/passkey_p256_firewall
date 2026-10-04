@@ -23,7 +23,7 @@ Shared network details are in the [root README](../README.md). This hook needs
 
 ## What the hook checks
 
-1. Rebuild the 53-byte payload from direction, `Sequence`, counterparty, and drops.
+1. Rebuild the 53-byte challenge. Payments use direction, `Sequence`, counterparty, and drops. Every other gated type uses kind byte `2`, `Sequence`, and the transaction hash described below.
 2. Read the one `xahau.passkey.v2` memo.
 3. `authenticatorData` is 37 to 128 bytes, its first 32 bytes equal state `RP`, and the
    flags include user presence (`0x01`) and user verification (`0x04`).
@@ -36,7 +36,7 @@ Shared network details are in the [root README](../README.md). This hook needs
 is not rejected, so a synced passkey can pass this gate. The check is that this passkey
 signed this payment, not that the key is unable to leave the device.
 
-## Challenge payload (53 bytes)
+## Payment challenge (53 bytes)
 
 | Offset | Length | Field |
 |--------|--------|-------|
@@ -73,9 +73,23 @@ without signing again. `authenticatorData` and `clientDataJSON` are copied uncha
 | `RP` | 32 | `SHA-256` of the relying party id, for example `passkey.xahau-dev.net` |
 | `OR` | 8..64 | exact origin, for example `https://passkey.xahau-dev.net` |
 | `MODE` | 1 | `0` outgoing (default), `1` incoming, `2` both |
+| `LV` | 1 | `1` payments (default), `2` value and account control, `3` every outgoing transaction |
 
-`OR` is ASCII without quotes, backslashes, or spaces. A gated payment rolls back until
+`OR` is ASCII without quotes, backslashes, or spaces. A gated transaction rolls back until
 `PX`, `PY`, `RP`, and `OR` are all set. The owner sets them with an Invoke.
+
+`LV` unset is level 1: only native payments are gated, and every other type passes. Level 2 also gates outgoing value and account-control transactions, including Invoke, so the configuration cannot be changed without a passkey. `SetHook` still passes at level 2, which is how the account key removes the hook if the passkey is lost. Level 3 gates every outgoing transaction the hook runs on, including `SetHook`. Incoming non-payments pass at every level. A lost passkey at level 3 cannot remove the hook.
+
+Payments keep the payment challenge above. Any other gated transaction uses this 53-byte challenge instead. Pass those raw bytes as the WebAuthn `challenge`.
+
+| Offset | Length | Field |
+|--------|--------|-------|
+| 0 | 16 | ASCII `xahau.passkey.v2` |
+| 16 | 1 | `2` |
+| 17 | 4 | tx `Sequence` as uint32 big-endian |
+| 21 | 32 | SHA-256 of the serialized tx with `Memos`, `TxnSignature`, and `Signers` removed |
+
+`SigningPubKey` stays in that hash. The whole serialized transaction, memos included, must be at most 2048 bytes. At level 1 the owner Invoke is unsigned. At level 2 and 3 the Invoke is signed with this challenge, and then the parameters are applied. The same 220-byte `clientDataJSON` rules apply. Kind byte `2` keeps the challenge at 53 bytes, so the base64url form is still 71 characters.
 
 ## Browser
 
@@ -115,14 +129,28 @@ test installs the hook unnamed and checks:
 - Incoming is allowed while `MODE` is `0`.
 - An Invoke from another account is rejected.
 - A native partial payment is rejected by the devnet before the hook runs.
+- At level 1 an `AccountSet` passes. At level 2 it rolls back unless the transaction-hash
+  challenge matches, and a payment challenge does not count.
+- At level 2 an unsigned Invoke rolls back and a `SetHook` passes through the hook. A signed
+  Invoke can raise `LV` to 3. At level 3 a `SetHook` that would delete the hook rolls back,
+  and the hook stays installed.
 
-Do not set `HookName`. `HookOn` for Payment and Invoke is
-`FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7FFFFFFFFFFFFFFFFFFBFFFFE`.
+Do not set `HookName`. `HookOn` runs the hook for every transaction type except
+`GenesisMint`, `Amendment`, `Fee`, `UNLModify`, `EmitFailure`, and `UNLReport`:
+
+`00000000000000000000000000000000000001F1000000000000000000400000`
+
+Bit 22 (`SetHook`) is active-high. The other bits are active-low.
 
 ## Limits
 
-Replay protection is the `Sequence` inside the challenge. Key rotation does not ask for the
-old passkey. DestinationTag and Fee are not in the payload. `clientDataJSON` must be the
-compact form browsers emit, at most 220 bytes: no escapes, no spaces, and the type,
-challenge, and origin tokens written as JSON strings. The hook proves this P-256 key signed this payment inside
-WebAuthn. It does not replace the Xahau account signature.
+Replay protection is the `Sequence` inside the challenge. At level 1, key rotation does not
+ask for the old passkey. At level 2 and 3 the Invoke that changes state needs this passkey.
+DestinationTag and Fee are not in the payment challenge. They are covered for every other
+gated type, because that challenge hashes the canonical transaction. `clientDataJSON` must
+be the compact form browsers emit, at most 220 bytes: no escapes, no spaces, and the type,
+challenge, and origin tokens written as JSON strings. The hook proves this P-256 key signed
+this transaction inside WebAuthn. It does not replace the Xahau account signature. A
+transaction larger than 2048 serialized bytes cannot be authorized and rolls back when its
+type is gated. A `SetHook` carrying this wasm is larger than that, so at level 3 delete
+the hook with a small passkey-signed `SetHook` before installing a replacement.

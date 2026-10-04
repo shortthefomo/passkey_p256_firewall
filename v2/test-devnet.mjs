@@ -11,11 +11,20 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { derive, libraries, signAndSubmit, utils, XrplClient } from "xrpl-accountlib";
+import {
+  binary,
+  derive,
+  libraries,
+  signAndSubmit,
+  utils,
+  XrplClient,
+  XrplDefinitions,
+} from "xrpl-accountlib";
 import {
   assertSignerFixtures,
   authenticatorData,
   buildPayload,
+  buildTxPayload,
   clientDataJSON,
   DEVICE_FLAGS,
   FLAG_UP,
@@ -73,18 +82,15 @@ function hookExecutions(res) {
   });
 }
 
-// Active-low 256-bit mask. The seed already leaves ttHOOK_SET (bit 22) off.
-// Passing a name toggles that bit, which turns the hook on for that type.
-function calculateHookOn(names) {
-  const typeCode = { Payment: 0, Invoke: 99 };
-  let mask = BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFBFFFFF");
-  for (const name of names) {
-    const bit = typeCode[name];
-    if (bit === undefined) throw new Error("unknown transaction type " + name);
-    mask ^= 1n << BigInt(bit);
-  }
+// Every bit except ttHOOK_SET (22) is active-low: 0 runs the hook.
+// Bit 22 is active-high: 1 runs the hook on SetHook.
+// Network-control types stay off. LV decides which running types roll back.
+const HOOK_SKIP = [96, 100, 101, 102, 103, 104];
+const HOOK_ON = (() => {
+  let mask = 1n << 22n;
+  for (const bit of HOOK_SKIP) mask |= 1n << BigInt(bit);
   return mask.toString(16).padStart(64, "0").toUpperCase();
-}
+})();
 
 function hookParameters(pairs) {
   const asHex = (value) => {
@@ -131,16 +137,21 @@ async function faucetAccount() {
   throw new Error("faucet failed after retries");
 }
 
-async function submit(client, wallet, tx) {
+async function preparedTx(client, wallet, tx) {
   const net = await utils.txNetworkAndAccountValues(client, wallet);
-  const prepared = {
+  return {
     ...tx,
     Account: wallet.address,
     NetworkID: NETWORK_ID,
     Sequence: tx.Sequence ?? net.txValues.Sequence,
     Fee: tx.Fee || TX_FEE,
-    LastLedgerSequence: (net.networkInfo.ledgerSequence || 0) + 120,
+    LastLedgerSequence:
+      tx.LastLedgerSequence ?? (net.networkInfo.ledgerSequence || 0) + 120,
   };
+}
+
+async function submit(client, wallet, tx) {
+  const prepared = await preparedTx(client, wallet, tx);
   const submitted = await signAndSubmit(prepared, client, wallet);
   const response = submitted.response || {};
   const prelimResult = response.engine_result || response.error || "unknown";
@@ -204,6 +215,21 @@ async function submit(client, wallet, tx) {
   }
   log("  -> not validated", prelimResult);
   return packed;
+}
+
+function recordText(name, res, needle) {
+  const text = hookExecutions(res).map((h) => h.text).join(" | ");
+  const ok = text.includes(needle);
+  results.push({
+    name,
+    ok,
+    got: text,
+    expected: needle,
+    hash: res.hash,
+    hooks: hookExecutions(res),
+  });
+  log(ok ? "PASS" : "FAIL", name, JSON.stringify(text));
+  return ok;
 }
 
 function record(name, res, expected) {
@@ -279,6 +305,62 @@ async function signedPayment(
   });
 }
 
+async function codecDefinitions(client) {
+  const raw = await client.definitions();
+  if (raw && typeof raw.FIELDS === "object") return new XrplDefinitions(raw);
+  return undefined;
+}
+
+function signingPubKey(wallet) {
+  const pub = wallet.keypair && wallet.keypair.publicKey;
+  if (!pub) throw new Error("wallet is missing keypair.publicKey");
+  return pub;
+}
+
+function canonicalHex(tx, pub, definitions) {
+  const body = { ...tx, SigningPubKey: pub };
+  delete body.Memos;
+  delete body.TxnSignature;
+  delete body.Signers;
+  return binary.encode(body, definitions);
+}
+
+async function passkeyMemo(prepared, wallet, definitions, passkey) {
+  const hex = canonicalHex(prepared, signingPubKey(wallet), definitions);
+  const txHash = await sha256(Buffer.from(hex, "hex"));
+  const payload = buildTxPayload({ sequence: prepared.Sequence, txHash });
+  const assertion = await signWebAuthn({
+    pkcs8: passkey.pkcs8,
+    payload,
+    rpId: RP_ID,
+    origin: ORIGIN,
+  });
+  if (!(await verifyPayload(passkey.raw, assertion.message, assertion.sig)))
+    throw new Error("local WebAuthn verify failed before submit");
+  return memoFromWebAuthn(assertion);
+}
+
+const NAMESPACE =
+  "506173736B657930320000000000000000000000000000000000000000000002";
+
+function hookBody(wasmHex) {
+  return {
+    TransactionType: "SetHook",
+    Fee: String((wasmHex.length / 2) * 500 + 2_000_000),
+    Hooks: [
+      {
+        Hook: {
+          CreateCode: wasmHex,
+          Flags: 1,
+          HookApiVersion: 0,
+          HookNamespace: NAMESPACE,
+          HookOn: HOOK_ON,
+        },
+      },
+    ],
+  };
+}
+
 function summary() {
   log("---");
   for (const item of results) {
@@ -314,10 +396,9 @@ async function main() {
     throw new Error("clientDataJSON is missing the assertion type");
   log("signer self-check ok");
 
-  const on = calculateHookOn(["Payment", "Invoke"]);
-  if (on !== "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7FFFFFFFFFFFFFFFFFFBFFFFE")
-    throw new Error("unexpected HookOn mask " + on);
-  log("HookOn", on);
+  if (HOOK_ON !== "00000000000000000000000000000000000001F1000000000000000000400000")
+    throw new Error("unexpected HookOn mask " + HOOK_ON);
+  log("HookOn", HOOK_ON);
 
   const client = new XrplClient(WSS);
   try {
@@ -346,26 +427,9 @@ async function main() {
     const ownerId = Buffer.from(decodeAccountID(owner.address));
     const otherId = Buffer.from(decodeAccountID(other.address));
 
-    const setHook = await submit(client, owner.wallet, {
-      TransactionType: "SetHook",
-      Account: owner.address,
-      Fee: String((wasmHex.length / 2) * 500 + 2_000_000),
-      Hooks: [
-        {
-          Hook: {
-            CreateCode: wasmHex,
-            Flags: 1,
-            HookApiVersion: 0,
-            HookNamespace:
-              "506173736B657930320000000000000000000000000000000000000000000002",
-            // Leave the hook unnamed. A HookName makes it opt-in: the hook
-            // runs only when the transaction repeats that name, so a payment
-            // can skip the firewall by omitting it.
-            HookOn: on,
-          },
-        },
-      ],
-    });
+    // Leave the hook unnamed. A HookName makes it opt-in, so a transaction
+    // can skip the firewall by omitting the name.
+    const setHook = await submit(client, owner.wallet, hookBody(wasmHex));
     record("install hook", setHook, "tesSUCCESS");
     if (txResult(setHook) !== "tesSUCCESS") {
       log("install failed, stopping");
@@ -586,6 +650,145 @@ async function main() {
     // This devnet rejects a native partial before hooks run. The hook still
   // refuses tfPartialPayment if a partial payment is applied.
   record("partial payment rejected", partial, "temBAD_SEND_NATIVE_PARTIAL");
+
+    const definitions = await codecDefinitions(client);
+    log("definitions", definitions ? "network" : "codec default");
+
+    const openSet = await submit(client, owner.wallet, {
+      TransactionType: "AccountSet",
+      SetFlag: 8,
+      Fee: TX_FEE,
+    });
+    record("AccountSet allowed at level 1", openSet, "tesSUCCESS");
+
+    const level2 = await submit(client, owner.wallet, {
+      TransactionType: "Invoke",
+      Destination: owner.address,
+      Fee: TX_FEE,
+      HookParameters: hookParameters([["LV", "02"]]),
+    });
+    record("set LV=2", level2, "tesSUCCESS");
+
+    const blockedSet = await submit(client, owner.wallet, {
+      TransactionType: "AccountSet",
+      SetFlag: 8,
+      Fee: TX_FEE,
+    });
+    record("AccountSet without memo rejected at level 2", blockedSet, "tecHOOK_REJECTED");
+
+    const payMemoSeq = await accountSequence(client, owner.address);
+    const payPayload = buildPayload({
+      direction: 0,
+      sequence: payMemoSeq,
+      counterparty: otherId,
+      drops: 1000000n,
+    });
+    const payAssertion = await signWebAuthn({
+      pkcs8: passkey.pkcs8,
+      payload: payPayload,
+      rpId: RP_ID,
+      origin: ORIGIN,
+    });
+    const payMemo = await submit(client, owner.wallet, {
+      TransactionType: "AccountSet",
+      SetFlag: 8,
+      Sequence: payMemoSeq,
+      Fee: TX_FEE,
+      Memos: [memoFromWebAuthn(payAssertion)],
+    });
+    record("payment challenge does not authorize AccountSet", payMemo, "tecHOOK_REJECTED");
+
+    const mismatch = await preparedTx(client, owner.wallet, {
+      TransactionType: "AccountSet",
+      SetFlag: 8,
+      Fee: TX_FEE,
+    });
+    const mismatchMemo = await passkeyMemo(mismatch, owner.wallet, definitions, passkey);
+    mismatch.Domain = "6578616D706C65";
+    mismatch.Memos = [mismatchMemo];
+    record(
+      "AccountSet signed for different fields rejected",
+      await submit(client, owner.wallet, mismatch),
+      "tecHOOK_REJECTED"
+    );
+
+    const goodSet = await preparedTx(client, owner.wallet, {
+      TransactionType: "AccountSet",
+      SetFlag: 8,
+      Fee: TX_FEE,
+    });
+    goodSet.Memos = [await passkeyMemo(goodSet, owner.wallet, definitions, passkey)];
+    record(
+      "AccountSet with valid assertion accepted",
+      await submit(client, owner.wallet, goodSet),
+      "tesSUCCESS"
+    );
+
+    const stillPays = await signedPayment(client, owner.wallet, {
+      destination: other.address,
+      drops: 1000000n,
+      direction: 0,
+      counterparty: otherId,
+      passkey,
+    });
+    record("payment still accepted at level 2", stillPays, "tesSUCCESS");
+
+    const unsignedInvoke = await submit(client, owner.wallet, {
+      TransactionType: "Invoke",
+      Destination: owner.address,
+      Fee: TX_FEE,
+      HookParameters: hookParameters([["LV", "01"]]),
+    });
+    record("unsigned Invoke rejected at level 2", unsignedInvoke, "tecHOOK_REJECTED");
+
+    const reinstall = await submit(client, owner.wallet, hookBody(wasmHex));
+    record("SetHook allowed at level 2", reinstall, "tesSUCCESS");
+    recordText("SetHook at level 2 ran and passed through", reinstall, "passthrough");
+
+    const toLevel3 = await preparedTx(client, owner.wallet, {
+      TransactionType: "Invoke",
+      Destination: owner.address,
+      Fee: TX_FEE,
+      HookParameters: hookParameters([["LV", "03"]]),
+    });
+    toLevel3.Memos = [await passkeyMemo(toLevel3, owner.wallet, definitions, passkey)];
+    record(
+      "signed Invoke sets LV=3",
+      await submit(client, owner.wallet, toLevel3),
+      "tesSUCCESS"
+    );
+
+    const blockedAt3 = await submit(client, owner.wallet, {
+      TransactionType: "AccountSet",
+      SetFlag: 8,
+      Fee: TX_FEE,
+    });
+    record("AccountSet without memo rejected at level 3", blockedAt3, "tecHOOK_REJECTED");
+
+    const invokeAt3 = await submit(client, owner.wallet, {
+      TransactionType: "Invoke",
+      Destination: owner.address,
+      Fee: TX_FEE,
+      HookParameters: hookParameters([["LV", "01"]]),
+    });
+    record("unsigned Invoke rejected at level 3", invokeAt3, "tecHOOK_REJECTED");
+
+    const deleteHook = await submit(client, owner.wallet, {
+      TransactionType: "SetHook",
+      Fee: TX_FEE,
+      Hooks: [{ Hook: { CreateCode: "", Flags: 1 } }],
+    });
+    record("SetHook delete without memo rejected at level 3", deleteHook, "tecHOOK_REJECTED");
+    recordText("SetHook at level 3 reached the hook", deleteHook, "passkey:");
+
+    const paysAt3 = await signedPayment(client, owner.wallet, {
+      destination: other.address,
+      drops: 1000000n,
+      direction: 0,
+      counterparty: otherId,
+      passkey,
+    });
+    record("payment still accepted at level 3", paysAt3, "tesSUCCESS");
 
     writeWallets(owner, other, passkey);
     summary();

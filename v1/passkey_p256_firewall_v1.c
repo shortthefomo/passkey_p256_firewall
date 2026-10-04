@@ -3,19 +3,25 @@
 // Plain ECDSA over SHA-256 of a 53-byte payload. A WebAuthn assertion is a
 // different hook: see ../v2.
 //
-// A gated native payment must carry a P-256 ECDSA signature over
-// SHA-256(canonical payload). The signature is the memo; the payload is
-// rebuilt from the transaction so the memo cannot invent the amount,
-// sequence, or counterparty.
+// A gated transaction must carry a P-256 ECDSA signature over
+// SHA-256(canonical payload). The signature is the memo. The hook rebuilds
+// the payload, so the memo cannot invent it.
 //
 // Requires util_sha256 and util_verify_p256 (HooksUpdate2, xahaud PR 511).
 //
-// Canonical payload, 53 bytes:
+// Payment payload, 53 bytes (every level, when MODE gates that direction):
 //   0  magic[16]      "xahau.passkey.v1"
 //  16  direction      0 outgoing, 1 incoming
 //  17  sequence[8]    tx Sequence as uint64 big-endian (high 4 bytes 0)
 //  25  counterparty   20-byte account id of the other party
 //  45  drops[8]       native amount in drops, uint64 big-endian
+//
+// Other gated transactions use a different 53-byte payload:
+//   0  magic[16]      "xahau.passkey.v1"
+//  16  kind           2
+//  17  sequence[4]    tx Sequence, big-endian
+//  21  txhash[32]     SHA-256 of the serialized tx with Memos, TxnSignature,
+//                    and Signers removed. SigningPubKey stays.
 //
 // MemoType  = "xahau.passkey.v1"
 // MemoData  = r || s, each 32 bytes big-endian
@@ -24,10 +30,15 @@
 //   "PX"   32  public key X
 //   "PY"   32  public key Y
 //   "MODE"  1  0 outgoing, 1 incoming, 2 both (default 0)
+//   "LV"    1  1 payments, 2 value and account control, 3 every outgoing tx
+//              (unset means 1)
 //
 // Invoke parameters (hook owner only) use those same names.
+// At level 1 the owner Invoke is unsigned. At level 2 and 3 it needs the
+// transaction payload above, then the parameters are applied.
 
 #include "hookapi.h"
+#include "../firewall_level.h"
 
 extern int64_t
 util_sha256(
@@ -132,8 +143,60 @@ passkey_signature(uint8_t sig[64])
     return 0;
 }
 
+// File scope so the compiler does not clear these inside the hook. A clear
+// loop over FW_TX_MAX would blow the worst-case instruction budget.
+static uint8_t fw_buf_a[FW_TX_MAX];
+static uint8_t fw_buf_b[FW_TX_MAX];
+
+//   1  hash written
+//  -1  the canonical bytes could not be built
+//  -2  the serialized transaction does not fit in FW_TX_MAX
+static inline __attribute__((always_inline)) int32_t
+canonical_hash(uint8_t hash[32])
+{
+    int64_t tx_slot = otxn_slot(1);
+    if (tx_slot < 0)
+        return -1;
+
+    int64_t n = slot((uint32_t)fw_buf_a, FW_TX_MAX, (uint32_t)tx_slot);
+    if (n == TOO_SMALL)
+        return -2;
+    if (n <= 0)
+        return -1;
+
+    // A missing field is copied through and reported as DOESNT_EXIST.
+    int64_t m = sto_erase(
+        (uint32_t)fw_buf_b, FW_TX_MAX, (uint32_t)fw_buf_a, (uint32_t)n, sfMemos);
+    if (m == DOESNT_EXIST)
+        m = n;
+    else if (m <= 0)
+        return -1;
+
+    n = sto_erase(
+        (uint32_t)fw_buf_a,
+        FW_TX_MAX,
+        (uint32_t)fw_buf_b,
+        (uint32_t)m,
+        sfTxnSignature);
+    if (n == DOESNT_EXIST)
+        n = m;
+    else if (n <= 0)
+        return -1;
+
+    m = sto_erase(
+        (uint32_t)fw_buf_b, FW_TX_MAX, (uint32_t)fw_buf_a, (uint32_t)n, sfSigners);
+    if (m == DOESNT_EXIST)
+        m = n;
+    else if (m <= 0)
+        return -1;
+
+    if (util_sha256((uint32_t)hash, 32, (uint32_t)fw_buf_b, (uint32_t)m) != 32)
+        return -1;
+    return 1;
+}
+
 static inline __attribute__((always_inline)) int64_t
-admin(uint8_t hook_acc[20], uint8_t otxn_acc[20])
+admin(uint8_t hook_acc[20], uint8_t otxn_acc[20], int32_t require_change)
 {
     if (!BUFFER_EQUAL_20(hook_acc, otxn_acc))
         FAIL("passkey: only the hook owner can configure");
@@ -175,8 +238,24 @@ admin(uint8_t hook_acc[20], uint8_t otxn_acc[20])
         FAIL("passkey: MODE must be 1 byte");
     }
 
-    if (!changed)
-        FAIL("passkey: Invoke needs PX, PY, and/or MODE");
+    uint8_t level[1];
+    uint8_t k_lv[2] = {'L', 'V'};
+    int64_t level_len = otxn_param(SBUF(level), SBUF(k_lv));
+    if (level_len == 1) {
+        if (level[0] < 1 || level[0] > FW_LEVEL_MAX)
+            FAIL("passkey: LV must be 1, 2, or 3");
+        if (state_set(SBUF(level), SBUF(k_lv)) < 0)
+            FAIL("passkey: could not store LV");
+        changed = 1;
+    } else if (level_len != DOESNT_EXIST) {
+        FAIL("passkey: LV must be 1 byte");
+    }
+
+    if (!changed) {
+        if (require_change)
+            FAIL("passkey: Invoke needs PX, PY, MODE, and/or LV");
+        OK("passkey: signature accepted");
+    }
 
     OK("passkey: configuration stored");
 }
@@ -287,6 +366,70 @@ payment(uint8_t hook_acc[20], uint8_t otxn_acc[20])
     OK("passkey: signature accepted");
 }
 
+// Verify the non-payment payload. *ready is 1 only when the signature is good.
+// The caller returns *ready == 0 as the accept or rollback result.
+static inline __attribute__((always_inline)) int64_t
+authorize_tx(int32_t* ready)
+{
+    *ready = 0;
+
+    uint8_t seq[4];
+    if (otxn_field(SBUF(seq), sfSequence) != 4)
+        FAIL("passkey: missing Sequence");
+
+    uint8_t txhash[32];
+    int32_t hashed = canonical_hash(txhash);
+    if (hashed == -2)
+        FAIL("passkey: transaction is too large to authorize");
+    if (hashed != 1)
+        FAIL("passkey: could not bind this transaction");
+
+    uint8_t px[32];
+    uint8_t py[32];
+    uint8_t k_px[2] = {'P', 'X'};
+    uint8_t k_py[2] = {'P', 'Y'};
+    if (state(SBUF(px), SBUF(k_px)) != 32 || state(SBUF(py), SBUF(k_py)) != 32)
+        FAIL("passkey: PX/PY are not set");
+
+    uint8_t payload[PAYLOAD_LEN];
+    for (int32_t i = 0; GUARD(16), i < 16; ++i)
+        payload[i] = PASSKEY_MAGIC[i];
+    payload[16] = FW_TX_KIND;
+    payload[17] = seq[0];
+    payload[18] = seq[1];
+    payload[19] = seq[2];
+    payload[20] = seq[3];
+    for (int32_t i = 0; GUARD(32), i < 32; ++i)
+        payload[21 + i] = txhash[i];
+
+    uint8_t sig[64];
+    int32_t found = passkey_signature(sig);
+    if (found == 0)
+        FAIL("passkey: no valid passkey memo found");
+    if (found == -1)
+        FAIL("passkey: memo is missing MemoData");
+    if (found != 1)
+        FAIL("passkey: MemoData must be 64 bytes");
+
+    uint8_t hash[32];
+    if (util_sha256(SBUF(hash), SBUF(payload)) != 32)
+        FAIL("passkey: sha256 failed");
+
+    int64_t verified = util_verify_p256(
+        SBUF(hash),
+        (uint32_t)sig,
+        32,
+        (uint32_t)(sig + 32),
+        32,
+        SBUF(px),
+        SBUF(py));
+    if (verified != 1)
+        FAIL("passkey: invalid P-256 passkey signature");
+
+    *ready = 1;
+    return 0;
+}
+
 int64_t
 hook(uint32_t reserved)
 {
@@ -300,10 +443,35 @@ hook(uint32_t reserved)
     if (otxn_field(SBUF(otxn_acc), sfAccount) != 20)
         FAIL("passkey: could not read origin account");
 
+    uint8_t level_buf[1];
+    uint8_t k_lv[2] = {'L', 'V'};
+    int64_t level_len = state(SBUF(level_buf), SBUF(k_lv));
+    uint8_t level = 1;
+    if (level_len == 1)
+        level = level_buf[0];
+    else if (level_len != DOESNT_EXIST)
+        FAIL("passkey: stored LV is invalid");
+    if (level < 1 || level > FW_LEVEL_MAX)
+        FAIL("passkey: stored LV is invalid");
+
     int64_t tt = otxn_type();
-    if (tt == ttINVOKE)
-        return admin(hook_acc, otxn_acc);
-    if (tt != ttPAYMENT)
+    // Level 1 keeps the unsigned owner Invoke so the firewall can be configured
+    // before a passkey is required for every Invoke.
+    if (tt == ttINVOKE && level < 2)
+        return admin(hook_acc, otxn_acc, 1);
+    if (tt == ttPAYMENT)
+        return payment(hook_acc, otxn_acc);
+
+    int32_t outgoing = BUFFER_EQUAL_20(hook_acc, otxn_acc);
+    uint8_t min_level = fw_gate_level(tt);
+    if (!outgoing || min_level == 0 || level < min_level)
         OK("passkey: passthrough");
-    return payment(hook_acc, otxn_acc);
+
+    int32_t ready = 0;
+    int64_t rc = authorize_tx(&ready);
+    if (!ready)
+        return rc;
+    if (tt == ttINVOKE)
+        return admin(hook_acc, otxn_acc, 0);
+    OK("passkey: signature accepted");
 }
