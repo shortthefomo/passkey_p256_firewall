@@ -25,6 +25,24 @@ Both hooks are fail-closed for a gated transaction: missing key material or a ba
 rolls the transaction back. Install one hook per account. Leave it unnamed, or a
 transaction can skip it by omitting the name.
 
+## Modes
+
+`MODE` is one byte of hook state. It selects which native-payment directions need a
+passkey. Unset means `0`. The owner sets it with an Invoke parameter named `MODE`.
+The value is one byte: `00`, `01`, or `02`. At level 1 that Invoke is unsigned. At
+level 2 and 3 the Invoke must carry a passkey before `MODE` is stored. Other
+transaction types follow `LV`. Incoming non-payments pass at every mode.
+
+| `MODE` | Payments that need a passkey |
+|--------|------------------------------|
+| 0 | Outgoing. Incoming payments pass. |
+| 1 | Incoming. Outgoing payments pass. |
+| 2 | Both directions. |
+
+An IOU on a gated payment path rolls back. `tfPartialPayment` rolls back. A gated
+payment without the stored key, or without a valid memo, rolls back. v1 needs `PX`
+and `PY`. v2 also needs `RP` and `OR`.
+
 ## Levels
 
 `LV` is one byte of hook state. Unset means level 1. The owner sets it with an Invoke
