@@ -2,7 +2,13 @@
   "name": "passkey-p256-firewall",
   "private": true,
   "type": "module",
-  "description": "Build and devnet-test the P-256 passkey firewall hook.",
+  "description": "Build and devnet-test the v1 and v2 P-256 passkey firewall hooks.",
+  "scripts": {
+    "build:v1": "v1/build.sh",
+    "build:v2": "v2/build.sh",
+    "test:v1": "node v1/test-devnet.mjs",
+    "test:v2": "node v2/test-devnet.mjs"
+  },
   "dependencies": {
     "xrpl-accountlib": "^9.3.2",
     "xrpl-client": "^2.4.0"

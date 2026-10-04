@@ -1,8 +1,9 @@
 #!/bin/bash
-# Compile passkey_p256_firewall.c to a Hooks WASM module.
+# Compile passkey_p256_firewall_v2.c to a Hooks WASM module.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# v2/ is passkey_p256_firewall/v2, so ../.. is hooks/ (xahaud lives beside this repo).
 ROOT="$(cd "$HERE/../.." && pwd)"
 
 # Prefer a clang that ships wasm-ld. Newer Homebrew LLVM builds sometimes omit it.
@@ -26,7 +27,12 @@ fi
 
 export PATH="$(dirname "$CLANG"):$PATH"
 
-OUT="$HERE/passkey_p256_firewall.wasm"
+if [ ! -f "$ROOT/xahaud/hook/hookapi.h" ]; then
+  echo "hookapi.h not found at $ROOT/xahaud/hook" >&2
+  exit 1
+fi
+
+OUT="$HERE/passkey_p256_firewall_v2.wasm"
 "$CLANG" \
   --target=wasm32-unknown-unknown \
   -std=c11 \
@@ -41,7 +47,7 @@ OUT="$HERE/passkey_p256_firewall.wasm"
   -Wl,--no-entry \
   -Wl,--export=hook \
   -o "$OUT" \
-  "$HERE/passkey_p256_firewall.c"
+  "$HERE/passkey_p256_firewall_v2.c"
 
 # The guard checker rejects custom sections (name, producers) and any
 # function that is not the exported hook. hook-cleaner is not installed here,
@@ -145,6 +151,11 @@ for fn in range(code_count):
             else:
                 _, k = sleb(body, k)
             continue
+        if op == 0x0E:  # br_table: vec(label) then default label
+            n, k = leb(body, k + 1)
+            for _ in range(n + 1):
+                _, k = leb(body, k)
+            continue
         if op in (0x0C, 0x0D, 0x10, 0x20, 0x21, 0x22, 0x23, 0x24):
             _, k = leb(body, k + 1)
             continue
@@ -172,3 +183,12 @@ if problems:
 PY
 
 echo "wrote $OUT ($(wc -c < "$OUT") bytes) with $CLANG"
+
+HOST_CC="$(command -v cc || command -v clang || true)"
+if [ -z "$HOST_CC" ]; then
+  echo "Need a host cc to run the clientData parser checks" >&2
+  exit 1
+fi
+"$HOST_CC" -std=c11 -Wall -Wextra -Werror -o /tmp/passkey_v2_parse "$HERE/test-parse.c"
+/tmp/passkey_v2_parse
+rm -f /tmp/passkey_v2_parse

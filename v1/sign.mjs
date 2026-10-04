@@ -1,4 +1,4 @@
-// Reference signer for passkey_p256_firewall.c.
+// Reference signer for passkey_p256_firewall_v1.c.
 //
 // Builds the 53-byte payload the hook hashes, then signs it with ECDSA P-256
 // over SHA-256. WebCrypto returns the signature as r || s (64 bytes), which is

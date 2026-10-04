@@ -1,4 +1,4 @@
-// Deploy passkey_p256_firewall.wasm on the Passkey Hook Devnet and exercise it.
+// Deploy passkey_p256_firewall_v2.wasm on the Passkey Hook Devnet and exercise it.
 //
 //   ws:      wss://passkey.xahau-dev.net
 //   rpc:     https://rpc.passkey.xahau-dev.net
@@ -13,17 +13,25 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { derive, libraries, signAndSubmit, utils, XrplClient } from "xrpl-accountlib";
 import {
+  assertSignerFixtures,
+  authenticatorData,
   buildPayload,
+  clientDataJSON,
+  DEVICE_FLAGS,
+  FLAG_UP,
   generatePasskey,
-  memoFromSignature,
-  signPayload,
+  memoFromWebAuthn,
+  sha256,
+  signWebAuthn,
   verifyPayload,
 } from "./sign.mjs";
 
 const { decodeAccountID } = libraries.rippleAddressCodec;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const WASM_PATH = path.join(HERE, "passkey_p256_firewall.wasm");
+const WASM_PATH = path.join(HERE, "passkey_p256_firewall_v2.wasm");
+const RP_ID = "passkey.xahau-dev.net";
+const ORIGIN = "https://passkey.xahau-dev.net";
 const WSS = process.env.XAHAU_WSS || "wss://passkey.xahau-dev.net";
 const FAUCET = process.env.XAHAU_FAUCET || "https://faucet.passkey.xahau-dev.net/accounts";
 const NETWORK_ID = Number(process.env.XAHAU_NETWORK_ID || 21339);
@@ -238,17 +246,28 @@ async function accountSequence(client, address) {
   return info.account_data.Sequence;
 }
 
-async function signedPayment(client, wallet, { destination, drops, direction, counterparty, passkey, amount }) {
+async function signedPayment(
+  client,
+  wallet,
+  { destination, drops, direction, counterparty, passkey, amount, payloadDrops, rpId, origin, flags, type }
+) {
   const sequence = await accountSequence(client, wallet.address);
   const payload = buildPayload({
     direction,
     sequence,
     counterparty,
-    drops,
+    drops: payloadDrops ?? drops,
   });
-  const sig = await signPayload(passkey.pkcs8, payload);
-  const localOk = await verifyPayload(passkey.raw, payload, sig);
-  if (!localOk) throw new Error("local P-256 verify failed before submit");
+  const assertion = await signWebAuthn({
+    pkcs8: passkey.pkcs8,
+    payload,
+    rpId: rpId || RP_ID,
+    origin: origin || ORIGIN,
+    flags: flags ?? DEVICE_FLAGS,
+    type: type || "webauthn.get",
+  });
+  const localOk = await verifyPayload(passkey.raw, assertion.message, assertion.sig);
+  if (!localOk) throw new Error("local WebAuthn verify failed before submit");
   return submit(client, wallet, {
     TransactionType: "Payment",
     Account: wallet.address,
@@ -256,7 +275,7 @@ async function signedPayment(client, wallet, { destination, drops, direction, co
     Amount: amount || String(drops),
     Sequence: sequence,
     Fee: TX_FEE,
-    Memos: [memoFromSignature(sig)],
+    Memos: [memoFromWebAuthn(assertion)],
   });
 }
 
@@ -275,6 +294,7 @@ async function main() {
   const wasmHex = fs.readFileSync(WASM_PATH).toString("hex").toUpperCase();
   log("wasm", fs.statSync(WASM_PATH).size, "bytes");
 
+  assertSignerFixtures();
   const passkey = await generatePasskey();
   const probe = buildPayload({
     direction: 0,
@@ -282,9 +302,16 @@ async function main() {
     counterparty: Buffer.alloc(20, 7),
     drops: 1000000n,
   });
-  const probeSig = await signPayload(passkey.pkcs8, probe);
-  if (!(await verifyPayload(passkey.raw, probe, probeSig)))
+  const probeAssertion = await signWebAuthn({
+    pkcs8: passkey.pkcs8,
+    payload: probe,
+    rpId: RP_ID,
+    origin: ORIGIN,
+  });
+  if (!(await verifyPayload(passkey.raw, probeAssertion.message, probeAssertion.sig)))
     throw new Error("signer self-check failed");
+  if (probeAssertion.clientData.toString("utf8").indexOf("webauthn.get") < 0)
+    throw new Error("clientDataJSON is missing the assertion type");
   log("signer self-check ok");
 
   const on = calculateHookOn(["Payment", "Invoke"]);
@@ -330,7 +357,7 @@ async function main() {
             Flags: 1,
             HookApiVersion: 0,
             HookNamespace:
-              "506173736B657930310000000000000000000000000000000000000000000001",
+              "506173736B657930320000000000000000000000000000000000000000000002",
             // Leave the hook unnamed. A HookName makes it opt-in: the hook
             // runs only when the transaction repeats that name, so a payment
             // can skip the firewall by omitting it.
@@ -356,10 +383,12 @@ async function main() {
       HookParameters: hookParameters([
         ["PX", passkey.x.toString("hex")],
         ["PY", passkey.y.toString("hex")],
+        ["RP", (await sha256(Buffer.from(RP_ID, "utf8"))).toString("hex")],
+        ["OR", ORIGIN],
         ["MODE", "00"],
       ]),
     });
-    record("configure PX PY MODE=0", configure, "tesSUCCESS");
+    record("configure PX PY RP OR MODE=0", configure, "tesSUCCESS");
 
     const bareOut = await submit(client, owner.wallet, {
       TransactionType: "Payment",
@@ -377,7 +406,7 @@ async function main() {
       counterparty: otherId,
       passkey,
     });
-    record("outgoing with valid signature accepted", goodOut, "tesSUCCESS");
+    record("outgoing with valid WebAuthn assertion accepted", goodOut, "tesSUCCESS");
 
     const sequence = await accountSequence(client, owner.address);
     const badPayload = buildPayload({
@@ -386,8 +415,13 @@ async function main() {
       counterparty: otherId,
       drops: 1000000n,
     });
-    const badSig = Buffer.from(await signPayload(passkey.pkcs8, badPayload));
-    badSig[0] ^= 0xff;
+    const badAssertion = await signWebAuthn({
+      pkcs8: passkey.pkcs8,
+      payload: badPayload,
+      rpId: RP_ID,
+      origin: ORIGIN,
+    });
+    badAssertion.sig[0] ^= 0xff;
     const tampered = await submit(client, owner.wallet, {
       TransactionType: "Payment",
       Account: owner.address,
@@ -395,47 +429,91 @@ async function main() {
       Amount: "1000000",
       Sequence: sequence,
       Fee: TX_FEE,
-      Memos: [memoFromSignature(badSig)],
+      Memos: [memoFromWebAuthn(badAssertion)],
     });
     record("outgoing with tampered signature rejected", tampered, "tecHOOK_REJECTED");
 
-    const wrongAmountSeq = await accountSequence(client, owner.address);
-    const wrongAmountPayload = buildPayload({
+    const wrongAmount = await signedPayment(client, owner.wallet, {
+      destination: other.address,
+      drops: 2000000n,
+      payloadDrops: 1000000n,
       direction: 0,
-      sequence: wrongAmountSeq,
       counterparty: otherId,
-      drops: 1000000n,
-    });
-    const wrongAmountSig = await signPayload(passkey.pkcs8, wrongAmountPayload);
-    const wrongAmount = await submit(client, owner.wallet, {
-      TransactionType: "Payment",
-      Account: owner.address,
-      Destination: other.address,
-      Amount: "2000000",
-      Sequence: wrongAmountSeq,
-      Fee: TX_FEE,
-      Memos: [memoFromSignature(wrongAmountSig)],
+      passkey,
+      amount: "2000000",
     });
     record("outgoing signed for a different amount rejected", wrongAmount, "tecHOOK_REJECTED");
 
-    const shortMemoSeq = await accountSequence(client, owner.address);
-    const shortMemo = await submit(client, owner.wallet, {
+    const wrongRp = await signedPayment(client, owner.wallet, {
+      destination: other.address,
+      drops: 1000000n,
+      direction: 0,
+      counterparty: otherId,
+      passkey,
+      rpId: "evil.example",
+    });
+    record("outgoing with a different rpId rejected", wrongRp, "tecHOOK_REJECTED");
+
+    const noUv = await signedPayment(client, owner.wallet, {
+      destination: other.address,
+      drops: 1000000n,
+      direction: 0,
+      counterparty: otherId,
+      passkey,
+      flags: FLAG_UP,
+    });
+    record("outgoing without user verification rejected", noUv, "tecHOOK_REJECTED");
+
+    const wrongType = await signedPayment(client, owner.wallet, {
+      destination: other.address,
+      drops: 1000000n,
+      direction: 0,
+      counterparty: otherId,
+      passkey,
+      type: "webauthn.create",
+    });
+    record("outgoing registration assertion rejected", wrongType, "tecHOOK_REJECTED");
+
+    const v1Memo = await submit(client, owner.wallet, {
       TransactionType: "Payment",
       Account: owner.address,
       Destination: other.address,
       Amount: "1000000",
-      Sequence: shortMemoSeq,
       Fee: TX_FEE,
       Memos: [
         {
           Memo: {
             MemoType: Buffer.from("xahau.passkey.v1").toString("hex").toUpperCase(),
-            MemoData: "00".repeat(63),
+            MemoData: "ab".repeat(64),
           },
         },
       ],
     });
-    record("outgoing with 63-byte MemoData rejected", shortMemo, "tecHOOK_REJECTED");
+    record("v1 memo does not satisfy v2", v1Memo, "tecHOOK_REJECTED");
+
+    const { auth } = await authenticatorData({ rpId: RP_ID });
+    const truncated = clientDataJSON({ payload: probe, origin: ORIGIN });
+    const shortMemo = await submit(client, owner.wallet, {
+      TransactionType: "Payment",
+      Account: owner.address,
+      Destination: other.address,
+      Amount: "1000000",
+      Fee: TX_FEE,
+      Memos: [
+        {
+          Memo: {
+            MemoType: Buffer.from("xahau.passkey.v2").toString("hex").toUpperCase(),
+            MemoData: Buffer.concat([
+              Buffer.from([0x00, 0x25]),
+              auth,
+              Buffer.from([0x00, truncated.length]),
+              truncated,
+            ]).toString("hex").toUpperCase(),
+          },
+        },
+      ],
+    });
+    record("truncated v2 memo rejected", shortMemo, "tecHOOK_REJECTED");
 
     const incomingOpen = await submit(client, other.wallet, {
       TransactionType: "Payment",
@@ -480,7 +558,7 @@ async function main() {
       counterparty: otherId,
       passkey,
     });
-    record("incoming with valid signature accepted", incomingSigned, "tesSUCCESS");
+    record("incoming with valid WebAuthn assertion accepted", incomingSigned, "tesSUCCESS");
 
     const partialSeq = await accountSequence(client, owner.address);
     const partialPayload = buildPayload({
@@ -489,7 +567,12 @@ async function main() {
       counterparty: otherId,
       drops: 1000000n,
     });
-    const partialSig = await signPayload(passkey.pkcs8, partialPayload);
+    const partialAssertion = await signWebAuthn({
+      pkcs8: passkey.pkcs8,
+      payload: partialPayload,
+      rpId: RP_ID,
+      origin: ORIGIN,
+    });
     const partial = await submit(client, owner.wallet, {
       TransactionType: "Payment",
       Account: owner.address,
@@ -498,7 +581,7 @@ async function main() {
       Sequence: partialSeq,
       Fee: TX_FEE,
       Flags: 0x00020000,
-      Memos: [memoFromSignature(partialSig)],
+      Memos: [memoFromWebAuthn(partialAssertion)],
     });
     // This devnet rejects a native partial before hooks run. The hook still
   // refuses tfPartialPayment if a partial payment is applied.
@@ -514,7 +597,7 @@ async function main() {
 }
 
 function writeWallets(owner, other, passkey) {
-  const walletFile = "/tmp/passkey-devnet-wallets.json";
+  const walletFile = "/tmp/passkey-v2-devnet-wallets.json";
   fs.writeFileSync(
     walletFile,
     JSON.stringify(

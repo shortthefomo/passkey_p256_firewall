@@ -1,4 +1,7 @@
-// P-256 passkey firewall.
+// P-256 passkey firewall, v1.
+//
+// Plain ECDSA over SHA-256 of a 53-byte payload. A WebAuthn assertion is a
+// different hook: see ../v2.
 //
 // A gated native payment must carry a P-256 ECDSA signature over
 // SHA-256(canonical payload). The signature is the memo; the payload is
